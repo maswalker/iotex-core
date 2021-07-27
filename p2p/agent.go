@@ -83,6 +83,7 @@ type Agent struct {
 	broadcastInboundHandler    HandleBroadcastInbound
 	unicastInboundAsyncHandler HandleUnicastInboundAsync
 	host                       *p2p.Host
+	bootNodeAddr               []multiaddr.Multiaddr
 	unicastBlocklist           *BlockList
 }
 
@@ -231,6 +232,15 @@ func (p *Agent) Start(ctx context.Context) error {
 	}
 	p.host.JoinOverlay(ctx)
 	close(ready)
+
+	// debug check peers
+	nb, err := p.Neighbors(ctx)
+	if err != nil {
+		return err
+	}
+	for _, v := range nb {
+		log.L().Info("after connect", zap.String("neighbor", v.String()))
+	}
 	return nil
 }
 
@@ -375,17 +385,28 @@ func (p *Agent) Neighbors(ctx context.Context) ([]peerstore.PeerInfo, error) {
 	if host == nil {
 		return nil, ErrAgentNotStarted
 	}
-	var res []peerstore.PeerInfo
+
 	nbs, err := host.Neighbors(ctx)
 	if err != nil {
 		return nbs, err
 	}
 
+	// filter out bootnodes
+	var res []peerstore.PeerInfo
 	for i, nb := range nbs {
 		if p.unicastBlocklist.Blocked(nb.ID.Pretty(), time.Now()) || nb.ID.Pretty() == "" {
 			continue
 		}
-		res = append(res, nbs[i])
+		isValid := true
+		for _, bootNode := range p.bootNodeAddr {
+			if strings.Contains(bootNode.String(), nb.ID.Pretty()) {
+				isValid = false
+				break
+			}
+		}
+		if isValid {
+			res = append(res, nbs[i])
+		}
 	}
 	return res, nil
 }
@@ -396,17 +417,24 @@ func (p *Agent) connect(ctx context.Context) error {
 		return nil
 	}
 
+	if len(p.bootNodeAddr) == 0 {
+		// create boot nodes list beside itself
+		for _, bootstrapNode := range p.cfg.BootstrapNodes {
+			bootAddr := multiaddr.StringCast(bootstrapNode)
+			if strings.Contains(bootAddr.String(), p.host.HostIdentity()) {
+				continue
+			}
+			p.bootNodeAddr = append(p.bootNodeAddr, bootAddr)
+			log.L().Info("add bootstrap node:", zap.String("address", bootAddr.String()))
+		}
+	}
+
 	var tryNum, errNum, connNum, desiredConnNum int
 	conn := make(chan struct{}, len(p.cfg.BootstrapNodes))
 	connErrChan := make(chan error, len(p.cfg.BootstrapNodes))
 
 	// try to connect to all bootstrap node beside itself.
-	for _, bootstrapNode := range p.cfg.BootstrapNodes {
-		bootAddr := multiaddr.StringCast(bootstrapNode)
-		if strings.Contains(bootAddr.String(), p.host.HostIdentity()) {
-			continue
-		}
-
+	for _, bootAddr := range p.bootNodeAddr {
 		tryNum++
 		go func() {
 			if err := exponentialRetry(
@@ -424,7 +452,7 @@ func (p *Agent) connect(ctx context.Context) error {
 	}
 
 	// wait until half+1 bootnodes get connected
-	desiredConnNum = len(p.cfg.BootstrapNodes)/2 + 1
+	desiredConnNum = len(p.bootNodeAddr)/2 + 1
 	for {
 		select {
 		case err := <-connErrChan:
